@@ -6,7 +6,7 @@ GUI 模块 - tkinter 设置窗口
 - 动态刷新
 """
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import threading
 import os
 import sys
@@ -36,6 +36,7 @@ class BackupGUI:
         self._versions_var = None
         self._autostart_var = None
         self._select_all_var = None          # 全选勾选变量
+        self._path_var = None                # 存档路径变量
         self._exit_callback = None
         self._selected_save_path = None
         self._selected_relative_key = None
@@ -224,6 +225,17 @@ class BackupGUI:
         # 按钮 — 放在设置行右侧
         ttk.Button(row1, text="立即备份", command=self._on_backup_now).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(row1, text="隐藏窗口", command=self.hide).pack(side=tk.RIGHT, padx=(4, 0))
+
+        # 路径行
+        row_path = ttk.Frame(settings_frame)
+        row_path.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(row_path, text="存档路径:").pack(side=tk.LEFT, padx=(0, 4))
+        self._path_var = tk.StringVar(value=self._config.save_path)
+        path_entry = ttk.Entry(row_path, textvariable=self._path_var)
+        path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        path_entry.bind("<FocusOut>", lambda e: self._on_path_changed())
+        path_entry.bind("<Return>", lambda e: self._on_path_changed())
+        ttk.Button(row_path, text="浏览...", command=self._on_browse_path, width=6).pack(side=tk.RIGHT)
 
         # ==== 版权 ====
         copyright_lbl = ttk.Label(
@@ -536,6 +548,29 @@ class BackupGUI:
             self._autostart_var.set(not enable)
             if self._root.state() != "withdrawn":
                 messagebox.showerror("错误", msg, parent=self._root)
+
+    def _on_browse_path(self):
+        """浏览选择存档目录"""
+        current = self._path_var.get()
+        if not os.path.isdir(current):
+            current = os.path.expandvars("%APPDATA%")
+        path = filedialog.askdirectory(
+            parent=self._root, title="选择七日杀存档目录",
+            initialdir=current,
+        )
+        if path:
+            self._path_var.set(path)
+            self._on_path_changed()
+
+    def _on_path_changed(self):
+        """存档路径变更后实时保存"""
+        new_path = self._path_var.get().strip()
+        if new_path and os.path.isdir(new_path):
+            self._config.set("save_path", new_path)
+            self._refresh_data()
+        elif new_path:
+            # 路径无效，回显当前有效路径
+            self._path_var.set(self._config.save_path)
 
     # ========== 按钮事件 ==========
 
