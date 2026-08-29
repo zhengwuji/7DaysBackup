@@ -2,9 +2,12 @@
 系统托盘模块
 提供托盘图标、右键菜单、气泡提示
 使用 pystray + Pillow 实现
+开机自启时系统托盘（Explorer）可能未就绪，需等待并重试
 """
 import os
 import sys
+import time
+import ctypes
 import threading
 import logging
 from PIL import Image, ImageDraw
@@ -18,6 +21,25 @@ try:
 except ImportError:
     PYSTRAY_AVAILABLE = False
     logger.warning("pystray 未安装，托盘功能不可用")
+
+
+def _system_tray_ready() -> bool:
+    """检测 Windows 系统托盘（Shell_TrayWnd）是否就绪"""
+    try:
+        user32 = ctypes.windll.user32
+        return bool(user32.FindWindowW("Shell_TrayWnd", None))
+    except Exception:
+        return False
+
+
+def _wait_for_system_tray(timeout: int = 60) -> bool:
+    """等待系统托盘就绪（开机自启时 Explorer 可能还没初始化完成）"""
+    start = time.time()
+    while time.time() - start < timeout:
+        if _system_tray_ready():
+            return True
+        time.sleep(1)
+    return False
 
 
 def _get_resource_path(filename):
@@ -133,11 +155,24 @@ class TrayApp:
     # ========== 生命周期 ==========
 
     def start(self):
-        """启动托盘图标"""
+        """启动托盘图标（等待系统托盘就绪，失败则后台重试）"""
         if not PYSTRAY_AVAILABLE:
             logger.error("pystray 未安装，无法创建托盘图标")
             return False
 
+        if self._running:
+            return True
+
+        # 等待系统托盘就绪（开机自启时 Explorer 可能还没初始化）
+        if not _wait_for_system_tray(timeout=15):
+            logger.warning("等待系统托盘超时，将在后台持续重试")
+            threading.Thread(target=self._background_retry, daemon=True).start()
+            return False
+
+        return self._do_start()
+
+    def _do_start(self):
+        """实际创建托盘图标"""
         if self._running:
             return True
 
@@ -163,6 +198,20 @@ class TrayApp:
         except Exception as e:
             logger.error("创建托盘图标失败: %s", e)
             return False
+
+    def _background_retry(self):
+        """后台持续重试创建托盘（每 5 秒一次，直到成功）"""
+        attempt = 0
+        while not self._running:
+            attempt += 1
+            time.sleep(5)
+            if _system_tray_ready():
+                if self._do_start():
+                    logger.info("托盘图标重试成功（第 %d 次）", attempt)
+                    return
+            if attempt > 120:  # 最多重试约 10 分钟
+                logger.error("托盘图标重试失败，已放弃")
+                return
 
     def stop(self):
         """停止托盘图标"""

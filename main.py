@@ -211,10 +211,13 @@ def main():
     if _app_config.get("auto_start") and not StartupManager.is_enabled():
         StartupManager.enable()
 
-    # 启动托盘图标
-    if not _app_tray.start():
-        _logger.warning("托盘启动失败，直接显示窗口")
-        _app_gui.show()
+    # 启动托盘图标（等待系统托盘就绪，失败则后台自动重试）
+    tray_started = _app_tray.start()
+    if not tray_started:
+        _logger.warning("托盘图标暂时不可用（系统托盘未就绪），将后台重试")
+        # 非静默模式下先显示窗口，避免用户看不到程序
+        if not start_hidden:
+            _app_gui.show()
 
     # 是否显示窗口
     if not start_hidden:
