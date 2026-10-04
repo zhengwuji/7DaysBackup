@@ -1,0 +1,25 @@
+# 统一换行符处理
+* text=auto
+
+# 源码/配置一律 LF
+*.rs text
+*.py text
+*.md text
+*.yml text
+*.yaml text
+*.toml text
+*.json text
+*.txt text
+*.sh text eol=lf
+*.spec text
+
+# Windows 脚本用 CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源
+*.png binary
+*.ico binary
+*.jpg binary
+*.ttf binary
+*.zip binary
