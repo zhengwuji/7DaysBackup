@@ -46,9 +46,12 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
+          # Windows runner 默认 cp1252，输出中文会 UnicodeEncodeError
+          PYTHONIOENCODING: utf-8
         run: |
           python - <<'PYEOF'
-          import os
+          import os, sys
+          sys.stdout.reconfigure(encoding="utf-8")
           ver = os.environ["VERSION"].strip()
           lines = open("CHANGELOG.md", encoding="utf-8").read().splitlines()
           body, inside, found = [], False, False
@@ -62,8 +65,9 @@ jobs:
                   body.append(ln)
           if not found:
               body = ["本版本更新内容详见 [CHANGELOG.md](CHANGELOG.md)。"]
-          open("release_notes.md", "w", encoding="utf-8").write("\n".join(body).strip() + "\n")
-          print(open("release_notes.md", encoding="utf-8").read())
+          text = "\n".join(body).strip() + "\n"
+          open("release_notes.md", "w", encoding="utf-8").write(text)
+          print("release_notes.md written: %d chars" % len(text))
           PYEOF
 
       - name: Create GitHub Release
