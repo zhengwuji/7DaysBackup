@@ -1,0 +1,77 @@
+name: Release
+
+# 推送 v* 标签时自动编译 exe 并发布 GitHub Release，
+# 中文更新内容取自 CHANGELOG.md 中对应版本的段落
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Run Rust tests
+        working-directory: rust
+        run: cargo test --locked
+
+      - name: Build release exe
+        working-directory: rust
+        run: cargo build --release --locked
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist_pkg | Out-Null
+          Copy-Item rust/target/release/7DaysBackup.exe dist_pkg/
+          Copy-Item README.md dist_pkg/
+          Compress-Archive -Path dist_pkg/* -DestinationPath "7DaysBackup-${{ github.ref_name }}-win64.zip"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Extract changelog for this version
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          ver = os.environ["VERSION"].strip()
+          lines = open("CHANGELOG.md", encoding="utf-8").read().splitlines()
+          body, inside, found = [], False, False
+          for ln in lines:
+              if ln.startswith("## "):
+                  inside = (not found) and ln[3:].strip().startswith(ver)
+                  if inside:
+                      found = True
+                      continue
+              if inside:
+                  body.append(ln)
+          if not found:
+              body = ["本版本更新内容详见 [CHANGELOG.md](CHANGELOG.md)。"]
+          open("release_notes.md", "w", encoding="utf-8").write("\n".join(body).strip() + "\n")
+          print(open("release_notes.md", encoding="utf-8").read())
+          PYEOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 7DaysBackup ${{ github.ref_name }}
+          body_path: release_notes.md
+          fail_on_unmatched_files: true
+          files: |
+            rust/target/release/7DaysBackup.exe
+            7DaysBackup-${{ github.ref_name }}-win64.zip

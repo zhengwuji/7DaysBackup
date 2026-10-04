@@ -1,0 +1,56 @@
+name: CI
+
+# 只在代码变更时触发；纯文档（*.md、LICENSE、.gitignore）改动不触发编译
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    # 旧版 Python 实现的回归测试（启动/注册表相关，仅 Windows 可跑）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run tests
+        run: pytest -v
+
+  rust-build:
+    # 原生版：跑测试 + 编译 exe，产物可在本次运行页面下载
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Run Rust tests
+        working-directory: rust
+        run: cargo test --locked
+      - name: Build release exe
+        working-directory: rust
+        run: cargo build --release --locked
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7DaysBackup
+          path: rust/target/release/7DaysBackup.exe

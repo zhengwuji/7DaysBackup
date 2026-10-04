@@ -66,7 +66,7 @@ class BackupScheduler:
         self._notify_state(running=False, paused=False)
 
     def pause(self):
-        """暂停调度（跳过下一次触发）"""
+        """暂停调度（取消已排定的触发）"""
         with self._lock:
             if not self._running or self._paused:
                 return
@@ -88,42 +88,46 @@ class BackupScheduler:
         self._schedule_next()
 
     def update_interval(self, new_interval_seconds: int):
-        """动态更新间隔（>0 才有效）"""
+        """动态更新间隔（>0 才有效），立即按新间隔重新排定"""
         if new_interval_seconds <= 0:
             return
         self._config.set("backup_interval_seconds", new_interval_seconds)
         logger.info("备份间隔已更新为 %d 秒", new_interval_seconds)
-        # 重新调度
-        with self._lock:
-            if self._timer:
-                self._timer.cancel()
-                self._timer = None
-        if self._running and not self._paused:
-            self._schedule_next()
+        # _schedule_next 内部会先取消旧 timer，再按新间隔重排（未运行/暂停时不会排定）
+        self._schedule_next()
 
     def _schedule_next(self):
-        """安排下一次触发"""
+        """（重新）排定下一次触发；全程持锁，避免与 stop/update_interval 竞争产生双定时器"""
         with self._lock:
             if not self._running or self._paused:
                 return
-        interval = self._config.get("backup_interval_seconds", 60)
-        self._timer = threading.Timer(interval, self._on_tick)
-        self._timer.daemon = True
-        self._timer.start()
-
-        next_time = (datetime.now() + timedelta(seconds=interval)).strftime("%H:%M:%S")
+            if self._timer:
+                self._timer.cancel()
+            interval = self._config.get("backup_interval_seconds", 60)
+            timer = threading.Timer(interval, self._on_tick)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+            next_time = (datetime.now() + timedelta(seconds=interval)).strftime("%H:%M:%S")
         self._notify_state(next_backup=next_time, interval=interval)
 
     def _on_tick(self):
         """定时器触发"""
         with self._lock:
-            if self._busy:
-                logger.info("上次备份未完成，跳过本次触发")
-                self._schedule_next()
+            if not self._running:
                 return
-            self._busy = True
+            if self._busy:
+                reschedule = True
+            else:
+                reschedule = False
+                self._busy = True
 
-        logger.info("定时器触发备份")
+        if reschedule:
+            logger.info("上次备份未完成，跳过本次触发")
+            self._schedule_next()
+            return
+
+        logger.debug("定时器触发备份")
         self._notify_state(status="备份中...")
         try:
             self._engine.run_backup()

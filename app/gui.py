@@ -34,17 +34,22 @@ class BackupGUI:
         self._next_label = None
         self._interval_var = None
         self._versions_var = None
+        self._daily_keep_var = None          # 每日额外保留天数
         self._autostart_var = None
         self._select_all_var = None          # 全选勾选变量
         self._path_var = None                # 存档路径变量
+        self._output_var = None              # 备份输出位置变量
         self._exit_callback = None
         self._selected_save_path = None
         self._selected_relative_key = None
+        self._selected_map_name = None
+        self._selected_save_name = None
         self._backup_data = []
         self._selected_backup_idx = -1       # 保持选中状态跨刷新
         self._refresh_timer_id = None
         self._auto_refresh = True
         self._expanded_maps = set()          # 记录折叠状态：地图名集合
+        self._last_rows_sig = None           # 上次树数据签名，未变化时跳过重建（防闪烁）
 
     def set_exit_callback(self, fn):
         self._exit_callback = fn
@@ -195,7 +200,7 @@ class BackupGUI:
             value=self._config.get("backup_interval_seconds", 300) // 60
         )
         interval_spin = ttk.Spinbox(
-            row1, from_=1, to=60, width=5,
+            row1, from_=1, to=10080, width=6,
             textvariable=self._interval_var,
             command=self._on_setting_changed,
         )
@@ -215,6 +220,19 @@ class BackupGUI:
         versions_spin.pack(side=tk.LEFT, padx=(0, 20))
         versions_spin.bind("<FocusOut>", lambda e: self._on_setting_changed())
         versions_spin.bind("<Return>", lambda e: self._on_setting_changed())
+
+        ttk.Label(row1, text="每日额外保留(天):").pack(side=tk.LEFT, padx=(0, 4))
+        self._daily_keep_var = tk.IntVar(
+            value=self._config.get("daily_keep_days", 7)
+        )
+        daily_spin = ttk.Spinbox(
+            row1, from_=0, to=365, width=5,
+            textvariable=self._daily_keep_var,
+            command=self._on_setting_changed,
+        )
+        daily_spin.pack(side=tk.LEFT, padx=(0, 20))
+        daily_spin.bind("<FocusOut>", lambda e: self._on_setting_changed())
+        daily_spin.bind("<Return>", lambda e: self._on_setting_changed())
 
         self._autostart_var = tk.BooleanVar(value=self._startup_mgr.is_enabled())
         ttk.Checkbutton(
@@ -237,6 +255,18 @@ class BackupGUI:
         path_entry.bind("<Return>", lambda e: self._on_path_changed())
         ttk.Button(row_path, text="浏览...", command=self._on_browse_path, width=6).pack(side=tk.RIGHT)
 
+        # 备份输出位置行（留空 = 默认存到存档目录下的 backup 文件夹）
+        row_output = ttk.Frame(settings_frame)
+        row_output.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(row_output, text="备份保存位置:").pack(side=tk.LEFT, padx=(0, 4))
+        self._output_var = tk.StringVar(value=self._config.get("backup_output_path", "") or "")
+        output_entry = ttk.Entry(row_output, textvariable=self._output_var)
+        output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        output_entry.bind("<FocusOut>", lambda e: self._on_output_changed())
+        output_entry.bind("<Return>", lambda e: self._on_output_changed())
+        ttk.Label(row_output, text="(留空=存档目录内backup)", foreground="gray").pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(row_output, text="浏览...", command=self._on_browse_output, width=6).pack(side=tk.RIGHT)
+
         # ==== 版权 ====
         copyright_lbl = ttk.Label(
             main_frame, text="Developed by Lumore",
@@ -257,8 +287,27 @@ class BackupGUI:
     # ========== 数据刷新（保持折叠状态）==========
 
     def _refresh_data(self):
-        """刷新存档树、备份列表、状态（保持展开/折叠状态）"""
+        """刷新存档树、备份列表（保持展开/折叠状态；数据未变化时跳过重建防闪烁）"""
         try:
+            # 获取存档信息
+            saves_info = self._engine.get_all_saves_info()
+
+            # 首次运行自动全选（仅执行一次）
+            if not self._config.get("monitored_initialized") and len(saves_info) > 0:
+                for s in saves_info:
+                    self._config.set_monitored(s["relative_key"], True)
+                self._config.set("monitored_initialized", True)
+
+            # 数据签名：与上次一致则不重建树（避免每轮全量重扫后的闪烁与卡顿）
+            sig = [
+                (s["relative_key"], s["monitored"], s["last_backup"], s["last_modified"])
+                for s in saves_info
+            ]
+            if sig == self._last_rows_sig and self._tree.get_children():
+                self._refresh_backup_list()
+                return
+            self._last_rows_sig = sig
+
             selected_key = self._selected_relative_key
 
             # ---- 保存展开状态 ----
@@ -270,15 +319,6 @@ class BackupGUI:
             # 清空树
             for item in self._tree.get_children():
                 self._tree.delete(item)
-
-            # 获取存档信息
-            saves_info = self._engine.get_all_saves_info()
-
-            # 首次运行自动全选（仅执行一次）
-            if not self._config.get("monitored_initialized") and len(saves_info) > 0:
-                for s in saves_info:
-                    self._config.set_monitored(s["relative_key"], True)
-                self._config.set("monitored_initialized", True)
 
             # 按地图分组
             maps = {}
@@ -315,13 +355,6 @@ class BackupGUI:
                     if selected_key and s["relative_key"] == selected_key:
                         self._tree.selection_set(item_id)
 
-            # 更新状态栏
-            self._status_label.config(text=f"存档路径: {self._config.save_path}")
-            interval = self._config.get("backup_interval_seconds", 300)
-            self._next_label.config(
-                text=f"备份间隔: {interval} 秒 | 保留版本: {self._config.get('max_backup_versions', 10)}"
-            )
-
             self._refresh_backup_list()
 
         except Exception as e:
@@ -355,11 +388,14 @@ class BackupGUI:
         self._backup_listbox.delete(0, tk.END)
         self._backup_data = []
 
-        if not self._selected_save_path or not os.path.isdir(self._selected_save_path):
+        if not (self._selected_map_name and self._selected_save_name
+                and self._selected_save_path and os.path.isdir(self._selected_save_path)):
             self._backup_listbox.insert(tk.END, "（请先在左侧点击存档）")
             return
 
-        backups = self._engine.get_save_backups(self._selected_save_path)
+        backups = self._engine.get_save_backups(
+            self._selected_map_name, self._selected_save_name, self._selected_save_path
+        )
         if not backups:
             self._backup_listbox.insert(tk.END, "（暂无备份）")
             return
@@ -387,7 +423,7 @@ class BackupGUI:
             return
         if self._root.state() != "withdrawn":
             self._refresh_data()
-        self._refresh_timer_id = self._root.after(3000, self._start_refresh_cycle)
+        self._refresh_timer_id = self._root.after(15000, self._start_refresh_cycle)
 
     def _stop_auto_refresh(self):
         self._auto_refresh = False
@@ -422,6 +458,8 @@ class BackupGUI:
         if not parent:
             self._selected_relative_key = None
             self._selected_save_path = None
+            self._selected_map_name = None
+            self._selected_save_name = None
             self._refresh_backup_list()
             return
 
@@ -435,6 +473,8 @@ class BackupGUI:
             if info["relative_key"] == relative_key:
                 self._selected_relative_key = relative_key
                 self._selected_save_path = info["save_path"]
+                self._selected_map_name = info["map_name"]
+                self._selected_save_name = info["save_name"]
                 self._refresh_backup_list()
                 break
 
@@ -478,7 +518,12 @@ class BackupGUI:
             self.schedule_ui_update(
                 lambda: self._status_label.config(text="正在恢复存档...")
             )
-            ok = self._engine.restore_backup(backup["path"], self._selected_save_path)
+            ok = self._engine.restore_backup(
+                backup["path"],
+                self._selected_map_name,
+                self._selected_save_name,
+                self._selected_save_path,
+            )
             if ok:
                 self.schedule_ui_update(
                     lambda: messagebox.showinfo("恢复完成", "存档已成功恢复！", parent=self._root)
@@ -523,17 +568,26 @@ class BackupGUI:
         try:
             interval_min = self._interval_var.get()
             versions = self._versions_var.get()
+            daily_keep = self._daily_keep_var.get()
 
+            # 间隔范围：1 分钟 ~ 7 天
             if interval_min < 1:
                 interval_min = 1
                 self._interval_var.set(1)
+            elif interval_min > 10080:
+                interval_min = 10080
+                self._interval_var.set(10080)
             if versions < 1:
                 versions = 1
                 self._versions_var.set(1)
+            if daily_keep < 0:
+                daily_keep = 0
+                self._daily_keep_var.set(0)
 
             self._config.update({
                 "backup_interval_seconds": interval_min * 60,
                 "max_backup_versions": versions,
+                "daily_keep_days": daily_keep,
             })
             self._scheduler.update_interval(interval_min * 60)
             self._refresh_data()
@@ -544,6 +598,9 @@ class BackupGUI:
     def _on_autostart_toggle(self):
         enable = self._autostart_var.get()
         ok, msg = self._startup_mgr.toggle(enable)
+        # 无论快捷方式/注册表操作结果如何，都把用户意图持久化，
+        # 否则下次启动会按默认值重新创建自启项
+        self._config.set("auto_start", ok and enable)
         if not ok:
             self._autostart_var.set(not enable)
             if self._root.state() != "withdrawn":
@@ -567,10 +624,37 @@ class BackupGUI:
         new_path = self._path_var.get().strip()
         if new_path and os.path.isdir(new_path):
             self._config.set("save_path", new_path)
+            self._last_rows_sig = None
             self._refresh_data()
         elif new_path:
             # 路径无效，回显当前有效路径
             self._path_var.set(self._config.save_path)
+
+    def _on_browse_output(self):
+        """浏览选择备份输出目录"""
+        current = self._output_var.get().strip()
+        if not os.path.isdir(current):
+            current = self._config.save_path
+        path = filedialog.askdirectory(
+            parent=self._root, title="选择备份保存位置",
+            initialdir=current,
+        )
+        if path:
+            self._output_var.set(path)
+            self._on_output_changed()
+
+    def _on_output_changed(self):
+        """备份输出位置变更后实时保存（留空 = 默认存档目录内 backup 文件夹）"""
+        new_path = self._output_var.get().strip()
+        if new_path and not os.path.isdir(new_path):
+            # 目录无效，回显当前有效值
+            self._output_var.set(self._config.get("backup_output_path", "") or "")
+            return
+        if new_path == (self._config.get("backup_output_path", "") or "").strip():
+            return
+        self._config.set("backup_output_path", new_path)
+        self._last_rows_sig = None
+        self._refresh_data()
 
     # ========== 按钮事件 ==========
 

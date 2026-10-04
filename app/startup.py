@@ -1,108 +1,124 @@
 """
 开机自启管理模块
-在 Windows 启动文件夹中创建/删除快捷方式
-使用 PowerShell COM 对象创建 .lnk 文件
+通过注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 键实现
+（无需 PowerShell/COM，读写即时生效），并兼容清理旧版的启动文件夹 .lnk 快捷方式
 """
 import os
 import sys
-import subprocess
 import logging
 
 logger = logging.getLogger("BackupTool")
+
+try:
+    import winreg
+    WINREG_AVAILABLE = True
+except ImportError:
+    WINREG_AVAILABLE = False
+
+RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "7DaysBackup"
+SHORTCUT_NAME = "7DaysBackup.lnk"   # 旧版创建的快捷方式，启用注册表方式后清理
 
 
 class StartupManager:
     """Windows 开机自启管理"""
 
-    SHORTCUT_NAME = "7DaysBackup.lnk"
+    # ---------- 旧版 .lnk 兼容 ----------
 
     @staticmethod
     def get_startup_dir():
         """获取 Windows 启动文件夹路径"""
         return os.path.join(
-            os.getenv("APPDATA"),
+            os.getenv("APPDATA") or os.path.expanduser("~"),
             r"Microsoft\Windows\Start Menu\Programs\Startup"
         )
 
     @classmethod
     def get_shortcut_path(cls):
-        return os.path.join(cls.get_startup_dir(), cls.SHORTCUT_NAME)
+        return os.path.join(cls.get_startup_dir(), SHORTCUT_NAME)
 
     @classmethod
-    def is_enabled(cls):
-        """检查是否已启用开机自启"""
+    def _remove_legacy_shortcut(cls):
+        """删除旧版启动文件夹快捷方式（若存在）"""
+        shortcut_path = cls.get_shortcut_path()
+        try:
+            if os.path.exists(shortcut_path):
+                os.remove(shortcut_path)
+                logger.info("已清理旧版启动快捷方式: %s", shortcut_path)
+        except OSError as e:
+            logger.warning("清理旧版启动快捷方式失败: %s", e)
+
+    # ---------- 启动命令 ----------
+
+    @staticmethod
+    def _get_command() -> str:
+        """生成启动命令：exe 路径加引号，附加 --hidden 静默启动"""
+        if getattr(sys, "frozen", False):
+            return f'"{sys.executable}" --hidden'
+        # 开发模式：优先 pythonw.exe 启动 main.py
+        exe = sys.executable.replace("python.exe", "pythonw.exe")
+        if not os.path.exists(exe):
+            exe = sys.executable
+        main_py = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"
+        )
+        return f'"{exe}" "{main_py}" --hidden'
+
+    # ---------- 开关 ----------
+
+    @classmethod
+    def is_enabled(cls) -> bool:
+        """检查是否已启用开机自启（注册表键值或旧版 .lnk 存在均视为启用）"""
+        if WINREG_AVAILABLE:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH) as key:
+                    winreg.QueryValueEx(key, RUN_VALUE_NAME)
+                return True
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning("读取自启注册表失败: %s", e)
         return os.path.exists(cls.get_shortcut_path())
 
     @classmethod
     def enable(cls, exe_path=None):
-        """
-        启用开机自启
-        - 在启动文件夹创建快捷方式
-        - exe_path: 程序路径，默认为当前运行的可执行文件
-        """
-        if exe_path is None:
-            # 如果是 PyInstaller 打包的 exe
-            if getattr(sys, 'frozen', False):
-                exe_path = sys.executable
-            else:
-                # 开发模式，使用 pythonw.exe 启动 main.py
-                exe_path = sys.executable.replace("python.exe", "pythonw.exe")
-                # pythonw.exe 可能不存在，回退到 python.exe
-                if not os.path.exists(exe_path):
-                    exe_path = sys.executable
-
-        shortcut_path = cls.get_shortcut_path()
-        work_dir = os.path.dirname(exe_path)
-
+        """启用开机自启（exe_path 参数保留兼容旧签名，现忽略）"""
+        if not WINREG_AVAILABLE:
+            return False, "仅支持 Windows"
         try:
-            # 先确保启动目录存在
-            os.makedirs(cls.get_startup_dir(), exist_ok=True)
-
-            # 删除已存在的快捷方式
-            if os.path.exists(shortcut_path):
-                os.remove(shortcut_path)
-
-            # 使用 PowerShell 创建快捷方式
-            ps_script = f'''
-$WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("{shortcut_path}")
-$Shortcut.TargetPath = "{exe_path}"
-$Shortcut.Arguments = "--hidden"
-$Shortcut.WorkingDirectory = "{work_dir}"
-$Shortcut.WindowStyle = 7
-$Shortcut.Save()
-'''
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                capture_output=True, text=True, timeout=10
-            )
-
-            if result.returncode == 0:
-                logger.info("开机自启已启用: %s", shortcut_path)
-                return True, "开机自启已启用"
-            else:
-                logger.error("创建快捷方式失败: %s", result.stderr)
-                return False, f"创建快捷方式失败: {result.stderr}"
-
-        except subprocess.TimeoutExpired:
-            return False, "创建快捷方式超时"
-        except Exception as e:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.SetValueEx(
+                    key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cls._get_command()
+                )
+            cls._remove_legacy_shortcut()
+            logger.info("开机自启已启用: HKCU\\%s\\%s", RUN_KEY_PATH, RUN_VALUE_NAME)
+            return True, "开机自启已启用"
+        except OSError as e:
             logger.error("启用开机自启失败: %s", e)
             return False, f"启用失败: {e}"
 
     @classmethod
     def disable(cls):
         """禁用开机自启"""
-        shortcut_path = cls.get_shortcut_path()
-        try:
-            if os.path.exists(shortcut_path):
-                os.remove(shortcut_path)
-                logger.info("开机自启已禁用")
-                return True, "开机自启已禁用"
-            return True, "开机自启未启用"
-        except Exception as e:
-            logger.error("禁用开机自启失败: %s", e)
-            return False, f"禁用失败: {e}"
+        removed = False
+        if WINREG_AVAILABLE:
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE
+                ) as key:
+                    winreg.DeleteValue(key, RUN_VALUE_NAME)
+                removed = True
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.error("禁用开机自启失败: %s", e)
+                return False, f"禁用失败: {e}"
+        cls._remove_legacy_shortcut()
+        if removed or not WINREG_AVAILABLE:
+            return True, "开机自启已禁用"
+        return True, "开机自启未启用"
 
     @classmethod
     def toggle(cls, enable: bool, exe_path=None):

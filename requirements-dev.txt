@@ -1,0 +1,4 @@
+# 开发/构建依赖
+# 注意：Python 3.14+ 自带 Tcl/Tk 9，PyInstaller >= 6.22 才能正确打包 tkinter（Tcl data directory 报错）
+pyinstaller>=6.22.0
+pytest>=8.0.0

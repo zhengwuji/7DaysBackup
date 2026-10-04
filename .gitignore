@@ -1,4 +1,4 @@
-# Python
+# Python（旧版实现，保留作参照）
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -11,6 +11,9 @@ build/
 venv/
 .venv/
 
+# Rust（原生版）
+rust/target/
+
 # IDE
 .vscode/
 .idea/
@@ -20,6 +23,9 @@ venv/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 构建产物（exe 由 CI 自动编译，从 Releases 下载）
+*.exe
 
 # 运行时数据
 *.log

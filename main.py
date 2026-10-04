@@ -1,13 +1,15 @@
 """
 入口文件 main.py
-- 单实例进程锁
-- 日志初始化
+- 单实例锁（Windows 命名互斥量，无 PID 复用误判）
+- 日志初始化（带轮转，避免无限增长）
 - 模块组装与启动
 - 命令行参数: --hidden（静默启动到托盘）
 """
 import os
 import sys
 import logging
+import logging.handlers
+import ctypes
 import threading
 import time
 
@@ -29,12 +31,16 @@ _app_scheduler = None
 _app_gui = None
 _app_tray = None
 _logger = None
+_mutex_handle = None          # 单实例互斥量句柄，进程存活期间保持引用
+_shutting_down = False
+
+MUTEX_NAME = "Local\\7DaysBackup_SingleInstance"
 
 
 # ===================== 日志 =====================
 
 def setup_logging(config_dir: str):
-    """配置日志：同时输出到文件和 stderr"""
+    """配置日志：带轮转的文件输出 + stderr"""
     global _logger
 
     log_path = os.path.join(config_dir, "backup.log")
@@ -43,8 +49,10 @@ def setup_logging(config_dir: str):
     _logger = logging.getLogger("BackupTool")
     _logger.setLevel(logging.INFO)
 
-    # 文件 handler
-    fh = logging.FileHandler(log_path, encoding="utf-8")
+    # 文件 handler（1MB x 3 轮转）
+    fh = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
@@ -62,49 +70,53 @@ def setup_logging(config_dir: str):
 
 # ===================== 单实例锁 =====================
 
-def acquire_single_instance_lock(lock_dir: str) -> bool:
-    """尝试获取单实例锁"""
-    lock_path = os.path.join(lock_dir, "instance.lock")
-    os.makedirs(lock_dir, exist_ok=True)
-
+def acquire_single_instance_lock() -> bool:
+    """
+    通过 Windows 命名互斥量保证单实例。
+    互斥量随进程退出自动释放，不存在 PID 复用误判问题。
+    """
+    global _mutex_handle
     try:
-        if os.path.exists(lock_path):
-            try:
-                with open(lock_path, "r") as f:
-                    old_pid = int(f.read().strip())
-                # 检查进程是否还活着
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                handle = kernel32.OpenProcess(0x0400, False, old_pid)
-                if handle:
-                    kernel32.CloseHandle(handle)
-                    _logger and _logger.error("已有实例正在运行 (PID: %d)", old_pid)
-                    return False
-            except (ValueError, FileNotFoundError):
-                pass
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
 
-        with open(lock_path, "w") as f:
-            f.write(str(os.getpid()))
+        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        if not handle:
+            _logger and _logger.warning("创建实例互斥量失败，跳过单实例检测")
+            return True  # 保守放行，避免因检测失败无法启动
+
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            _logger and _logger.error("已有实例正在运行")
+            return False
+
+        _mutex_handle = handle
         return True
     except Exception as e:
-        _logger and _logger.warning("创建实例锁失败: %s", e)
+        _logger and _logger.warning("单实例检测失败: %s", e)
         return True
 
 
-def release_single_instance_lock(lock_dir: str):
-    """释放单实例锁"""
-    lock_path = os.path.join(lock_dir, "instance.lock")
-    try:
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except Exception:
-        pass
+def release_single_instance_lock():
+    """释放单实例互斥量"""
+    global _mutex_handle
+    if _mutex_handle:
+        try:
+            ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        except Exception:
+            pass
+        _mutex_handle = None
 
 
 # ===================== 退出处理 =====================
 
 def shutdown():
-    """优雅关闭所有模块"""
+    """优雅关闭所有模块（应在 tkinter 主线程执行，托盘退出经 schedule_ui_update 编组到此）"""
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+
     if _logger:
         _logger.info("正在退出...")
 
@@ -130,16 +142,25 @@ def shutdown():
             pass
 
     # 释放锁
-    if _app_config:
-        release_single_instance_lock(_app_config.config_dir)
+    release_single_instance_lock()
 
     if _logger:
         _logger.info("程序已退出")
+        logging.shutdown()
 
     os._exit(0)
 
 
 # ===================== 主流程 =====================
+
+def _fmt_interval(seconds: int) -> str:
+    """把秒数格式化为人类可读的间隔"""
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600} 小时"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60} 分钟"
+    return f"{seconds} 秒"
+
 
 def main():
     global _app_config, _app_engine, _app_scheduler, _app_gui, _app_tray
@@ -156,7 +177,7 @@ def main():
     _logger.info("7 Days Backup 启动 (PID: %d)", os.getpid())
 
     # 单实例锁
-    if not acquire_single_instance_lock(_app_config.config_dir):
+    if not acquire_single_instance_lock():
         _logger.error("检测到已有实例运行，退出")
         try:
             import tkinter.messagebox as mb
@@ -167,6 +188,8 @@ def main():
 
     # ---- 模块初始化 ----
     _app_engine = BackupEngine(_app_config)
+    # 清理上次异常退出残留的临时文件
+    _app_engine.cleanup_tmp_files()
     _app_scheduler = BackupScheduler(_app_config, _app_engine)
     _app_gui = BackupGUI(_app_config, _app_engine, _app_scheduler, StartupManager)
     _app_tray = TrayApp("7DaysBackup - 存档备份中")
@@ -179,9 +202,9 @@ def main():
         if status:
             _app_tray.update_tooltip(f"7DaysBackup - {status}")
         if state.get("next_backup"):
-            _app_gui.update_next_backup(
-                f"下次备份: {state['next_backup']} | 间隔: {state.get('interval', '--')} 秒"
-            )
+            interval = state.get("interval")
+            interval_text = f" | 间隔: {_fmt_interval(interval)}" if interval else ""
+            _app_gui.update_next_backup(f"下次备份: {state['next_backup']}{interval_text}")
 
     _app_scheduler.set_state_callback(on_scheduler_state)
 
@@ -197,7 +220,8 @@ def main():
     _app_tray.set_callback("backup_now", lambda: threading.Thread(
         target=_app_scheduler.run_once, daemon=True
     ).start())
-    _app_tray.set_callback("exit_app", shutdown)
+    # 退出动作编组回 tkinter 主线程执行，避免跨线程销毁窗口
+    _app_tray.set_callback("exit_app", lambda: _app_gui.schedule_ui_update(shutdown))
 
     # GUI 退出
     _app_gui.set_exit_callback(shutdown)
@@ -207,31 +231,28 @@ def main():
     # 创建 GUI（隐藏状态）
     _app_gui.setup()
 
-    # 开机自启：配置开关且快捷方式不存在时自动创建
+    # 开机自启：配置开关且未启用时自动创建
     if _app_config.get("auto_start") and not StartupManager.is_enabled():
         StartupManager.enable()
 
-    # 启动托盘图标（等待系统托盘就绪，失败则后台自动重试）
-    tray_started = _app_tray.start()
-    if not tray_started:
-        _logger.warning("托盘图标暂时不可用（系统托盘未就绪），将后台重试")
-        # 非静默模式下先显示窗口，避免用户看不到程序
-        if not start_hidden:
-            _app_gui.show()
-
-    # 是否显示窗口
+    # 是否显示窗口（先显示窗口，托盘等待不再阻塞界面出现）
     if not start_hidden:
         _app_gui.schedule_ui_update(_app_gui.show)
     else:
         _logger.info("静默启动到系统托盘")
 
+    # 启动托盘图标（等待系统托盘就绪，失败则后台自动重试）
+    tray_started = _app_tray.start()
+    if not tray_started:
+        _logger.warning("托盘图标暂时不可用（系统托盘未就绪），将后台重试")
+
     # 启动备份调度器
     _app_scheduler.start()
 
-    # 延迟 3 秒后执行首次备份
+    # 延迟 3 秒后执行首次备份（走调度器，统一 busy 状态与提示）
     def delayed_first_backup():
         time.sleep(3)
-        _app_engine.run_backup()
+        _app_scheduler.run_once()
 
     threading.Thread(target=delayed_first_backup, daemon=True).start()
 
